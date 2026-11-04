@@ -36,6 +36,7 @@ pub mod http;
 use std::collections::HashSet;
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
@@ -55,7 +56,8 @@ pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
 use crate::config::{
-    RestoreConfig, RestoredVfioConfig, VmMemoryZoneUpdateData, deserialize_restored_fd,
+    Error as ConfigError, RestoreConfig, RestoredVfioConfig, Result as ConfigResult,
+    VmMemoryZoneUpdateData, parse_inherited_fd, validate_inherited_fds,
 };
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
@@ -325,9 +327,9 @@ pub struct VmReceiveMigrationData {
     /// device's saved path or stale FD in the received VmConfig.
     #[serde(default)]
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub iommufd_fd: Option<i32>,
+    // Deserialized FD numbers carry no ownership and are discarded.
+    #[serde(skip_deserializing)]
+    pub iommufd_fd: Option<RawFd>,
     /// Optional memory zone update data
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
@@ -342,6 +344,8 @@ fn default_receive_migration_background_fetch_pages() -> bool {
 
 #[derive(Debug, Error)]
 pub enum VmReceiveMigrationConfigError {
+    #[error("Invalid inherited file descriptor")]
+    InheritedFd(#[from] ConfigError),
     /// Parsing of `VmReceiveMigrationData` failed
     #[error("Error parsing receive migration parameters")]
     ParseError(#[source] OptionParserError),
@@ -392,6 +396,7 @@ impl VmReceiveMigrationData {
         [,zone_updates=[<id@host_numa_node>]][,background_fetch_pages=on|off]\"";
 
     pub fn parse(migration: &str) -> Result<Self, VmReceiveMigrationConfigError> {
+        validate_inherited_fds([migration])?;
         let mut parser = OptionParser::new();
         parser
             .add("receiver_url")
@@ -417,26 +422,28 @@ impl VmReceiveMigrationData {
             .convert::<TupleList<String, u64>>("vfio_fds")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .map(|v| {
-                v.0.iter()
-                    .map(|Tuple(id, fd)| RestoredVfioConfig {
-                        id: id.clone(),
-                        fd: Some(*fd as i32),
+                v.0.into_iter()
+                    .map(|Tuple(id, fd)| {
+                        Ok(RestoredVfioConfig {
+                            id,
+                            fd: Some(parse_inherited_fd(fd)?),
+                        })
                     })
-                    .collect()
-            });
+                    .collect::<ConfigResult<Vec<_>>>()
+            })
+            .transpose()?;
         let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
-            .map_err(VmReceiveMigrationConfigError::ParseError)?;
+            .convert::<RawFd>("iommufd_fd")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?
+            .map(parse_inherited_fd)
+            .transpose()?;
 
         let zone_updates: Vec<VmMemoryZoneUpdateData> = parser
             .convert::<TupleList<String, u32>>("zone_updates")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .map_or(Vec::new(), |v| {
-                v.0.iter()
-                    .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData {
-                        id: id.clone(),
-                        host_numa_node: *host_numa_node,
-                    })
+                v.0.into_iter()
+                    .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData { id, host_numa_node })
                     .collect()
             });
 
@@ -2216,6 +2223,7 @@ mod tests {
     use std::{env, fs, process};
 
     use super::*;
+    use crate::tests::test_fd;
 
     struct TestDir {
         path: PathBuf,
@@ -2402,25 +2410,30 @@ mod tests {
             "Expected \"ParseError\"; got \"{e:?}\"",
         );
 
-        // vfio_fds without iommufd_fd parses fine now, the pairing is checked
-        // later against the received VmConfig by validate_vfio_fds.
-        let data =
-            VmReceiveMigrationData::parse("receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@5]")
-                .unwrap();
+        use std::os::fd::AsRawFd;
+        let cdev0 = test_fd();
+        let cdev1 = test_fd();
+        let iommu = test_fd();
+        let raw_fds = [cdev0.as_raw_fd(), cdev1.as_raw_fd(), iommu.as_raw_fd()];
+        let data = VmReceiveMigrationData::parse(&format!(
+            "receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@{}]",
+            raw_fds[0]
+        ))
+        .unwrap();
         assert!(data.iommufd_fd.is_none());
 
-        // vfio_fds entries with the iommufd FD.
-        let data = VmReceiveMigrationData::parse(
-            "receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@5,vfio1@7],iommufd_fd=9",
-        )
+        let data = VmReceiveMigrationData::parse(&format!(
+            "receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@{},vfio1@{}],iommufd_fd={}",
+            raw_fds[0], raw_fds[1], raw_fds[2]
+        ))
         .unwrap();
-        let fds = data.vfio_fds.expect("vfio_fds populated");
+        let fds = data.vfio_fds.as_ref().unwrap();
         assert_eq!(fds.len(), 2);
         assert_eq!(fds[0].id, "vfio0");
-        assert_eq!(fds[0].fd, Some(5));
         assert_eq!(fds[1].id, "vfio1");
-        assert_eq!(fds[1].fd, Some(7));
-        assert_eq!(data.iommufd_fd, Some(9));
+        assert_eq!(fds[0].fd.as_ref().unwrap().as_raw_fd(), raw_fds[0]);
+        assert_eq!(fds[1].fd.as_ref().unwrap().as_raw_fd(), raw_fds[1]);
+        assert_eq!(data.iommufd_fd.as_ref().unwrap().as_raw_fd(), raw_fds[2]);
 
         // zone update tests
         let e = VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,zone_updates=[]")

@@ -58,7 +58,8 @@ use crate::coredump::{
 };
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
-use crate::sparse::{next_data_extent, write_region_sparse};
+use crate::pagemap::PageMap;
+use crate::sparse::{clone_file_range, next_data_extent, write_region_sparse};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdMemorySource, UffdRange,
 };
@@ -77,7 +78,8 @@ pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
-const SNAPSHOT_FILENAME: &str = "memory-ranges";
+/// Filename used to store guest RAM in snapshot directories.
+pub const SNAPSHOT_FILENAME: &str = "memory-ranges";
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -236,6 +238,13 @@ fn size_clear_of_reserved(regions: &[ArchMemRegion], base: u64, size: u64) -> Re
     Ok(end - base)
 }
 
+// The snapshot memory file a copy-on-write restore mapped guest RAM from.
+struct CowSource {
+    file: File,
+    ranges: MemoryRangeTable,
+    pagemap: PageMap,
+}
+
 pub struct MemoryManager {
     boot_guest_memory: GuestMemoryMmap,
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
@@ -262,6 +271,7 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    cow_source: Option<CowSource>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -512,8 +522,7 @@ fn statfs_get_bsize(path: &str) -> Result<u64, Error> {
 }
 
 fn memory_zone_get_align_size(zone: &MemoryZoneConfig) -> Result<u64, Error> {
-    // SAFETY: FFI call. Trivially safe.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+    let page_size = get_page_size();
 
     // There is no backend file and the `hugepages` is disabled, just use system page size.
     if zone.file.is_none() && !zone.hugepages {
@@ -1028,7 +1037,20 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)
+        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        // Landlock applies after the restore, so the pagemap is opened here.
+        self.cow_source = match PageMap::open() {
+            Ok(pagemap) => Some(CowSource {
+                file: memory_file,
+                ranges: saved_regions.clone(),
+                pagemap,
+            }),
+            Err(e) => {
+                warn!("Restore (mode=copyonwrite): snapshots will write all guest memory: {e}");
+                None
+            }
+        };
+        Ok(())
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -1175,19 +1197,17 @@ impl MemoryManager {
         let guest_memory = self.guest_memory.memory();
         let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
 
-        // SAFETY: FFI call. Trivially safe.
-        let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let base_page_size = get_page_size();
 
         info!(
             "UFFD: registering {} region(s) for demand paging",
             saved_regions.ranges().len()
         );
 
-        if saved_regions
-            .ranges()
-            .iter()
-            .any(|range| range.gpa % base_page_size != 0 || range.length % base_page_size != 0)
-        {
+        if saved_regions.ranges().iter().any(|range| {
+            !range.gpa.is_multiple_of(base_page_size)
+                || !range.length.is_multiple_of(base_page_size)
+        }) {
             return Err(UffdError::UnalignedRanges.into());
         }
 
@@ -1196,8 +1216,10 @@ impl MemoryManager {
         let mut handler_ranges: Vec<UffdRange> = Vec::new();
 
         for range in saved_regions.ranges() {
+            // The range must not span across multiple guest RAM regions
             let host_addr = guest_memory
-                .get_host_address(GuestAddress(range.gpa))
+                .get_slice(GuestAddress(range.gpa), range.length as usize)
+                .and_then(|_| guest_memory.get_host_address(GuestAddress(range.gpa)))
                 .map_err(|e| UffdError::GpaTranslation {
                     gpa: range.gpa,
                     source: e,
@@ -2013,7 +2035,7 @@ impl MemoryManager {
         config: &MemoryConfig,
         prefault: Option<bool>,
         phys_bits: u8,
-        #[cfg(feature = "tdx")] tdx_enabled: bool,
+        #[cfg(feature = "sev_snp")] sev_snp_enabled: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -2208,10 +2230,10 @@ impl MemoryManager {
             .ok_or(Error::CreateSystemAllocator)?,
         ));
 
-        #[cfg(not(feature = "tdx"))]
+        #[cfg(not(feature = "sev_snp"))]
         let dynamic = true;
-        #[cfg(feature = "tdx")]
-        let dynamic = !tdx_enabled;
+        #[cfg(feature = "sev_snp")]
+        let dynamic = !sev_snp_enabled;
 
         let acpi_address = if dynamic
             && config.hotplug_method == HotplugMethod::Acpi
@@ -2258,11 +2280,12 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            cow_source: None,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
             acpi_address,
-            log_dirty: dynamic, // Cannot log dirty pages on a TD
+            log_dirty: dynamic, // Cannot log dirty pages on a CVM
             arch_mem_regions,
             ram_allocator,
             dynamic,
@@ -2284,6 +2307,7 @@ impl MemoryManager {
         memory_restore_mode: MemoryRestoreMode,
         phys_bits: u8,
         exit_evt: &EventFd,
+        #[cfg(feature = "sev_snp")] sev_snp_enabled: bool,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
@@ -2297,8 +2321,8 @@ impl MemoryManager {
                 config,
                 Some(prefault),
                 phys_bits,
-                #[cfg(feature = "tdx")]
-                false,
+                #[cfg(feature = "sev_snp")]
+                sev_snp_enabled,
                 Some(&mem_snapshot),
                 Default::default(),
             )?;
@@ -2372,7 +2396,7 @@ impl MemoryManager {
         hugepage_size: Option<u64>,
     ) -> Result<FileOffset, Error> {
         let fd = Self::memfd_create(
-            &ffi::CString::new("ch_ram").unwrap(),
+            c"ch_ram",
             libc::MFD_CLOEXEC
                 | libc::MFD_ALLOW_SEALING
                 | if hugepages {
@@ -2572,8 +2596,7 @@ impl MemoryManager {
         hugepages: bool,
         hugepage_size: Option<u64>,
     ) -> Result<u64, Error> {
-        // SAFETY: FFI call. Trivially safe.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        let page_size = get_page_size();
         match (hugepages, hugepage_size, backing_file) {
             (false, _, _) => Ok(page_size),
             (true, Some(hugepage_size), _) => Ok(hugepage_size),
@@ -3121,6 +3144,8 @@ impl MemoryManager {
             }
         }
 
+        // Memory zones iterate in hash order.
+        table.sort();
         Ok(table)
     }
 
@@ -3710,6 +3735,19 @@ impl Transportable for MemoryManager {
             .map(|r| r.length)
             .sum();
 
+        let guest_memory = self.guest_memory.memory();
+
+        if let Some(source) = &self.cow_source
+            && source.ranges == self.snapshot_memory_ranges
+        {
+            match clone_file_range(&source.file, &memory_file, total_len) {
+                Ok(()) => return write_private_pages(&guest_memory, source, &mut memory_file),
+                Err(e) => {
+                    warn!("Snapshot: restore source not cloned, writing all guest memory: {e}");
+                }
+            }
+        }
+
         // Pre-size the file so per-region write_at lands at the dense-layout
         // offset. On filesystems that support sparse files unwritten bytes
         // become real holes; on others the kernel zero-fills the allocation,
@@ -3719,7 +3757,6 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
-        let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
         for range in self.snapshot_memory_ranges.ranges() {
@@ -3748,30 +3785,14 @@ impl Transportable for MemoryManager {
 
             if !wrote_sparse {
                 // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE). Match the dense layout by seeking to
-                // file_cursor and streaming bytes via the existing
-                // volatile copy.
-                memory_file
-                    .seek(SeekFrom::Start(file_cursor))
-                    .context("Error seeking memory snapshot file")
-                    .map_err(MigratableError::MigrateSend)?;
-                let mut offset: u64 = 0;
-                // Manual partial-write loop preserves the workaround for
-                // https://github.com/rust-vmm/vm-memory/issues/174
-                loop {
-                    let bytes_written = guest_memory
-                        .write_volatile_to(
-                            GuestAddress(range.gpa + offset),
-                            &mut memory_file,
-                            (range.length - offset) as usize,
-                        )
-                        .context("Error writing dense memory snapshot region")
-                        .map_err(MigratableError::MigrateSend)?;
-                    offset += bytes_written as u64;
-                    if offset == range.length {
-                        break;
-                    }
-                }
+                // SEEK_HOLE).
+                write_guest_range(
+                    &guest_memory,
+                    &mut memory_file,
+                    file_cursor,
+                    range.gpa,
+                    range.length,
+                )?;
             }
 
             file_cursor += range.length;
@@ -3855,6 +3876,62 @@ impl Migratable for MemoryManager {
     }
 }
 
+// Streams guest memory `[gpa, gpa + length)` into `file` at `file_offset`.
+fn write_guest_range(
+    guest_memory: &GuestMemoryMmap,
+    file: &mut File,
+    file_offset: u64,
+    gpa: u64,
+    length: u64,
+) -> result::Result<(), MigratableError> {
+    file.seek(SeekFrom::Start(file_offset))
+        .context("Error seeking memory snapshot file")
+        .map_err(MigratableError::MigrateSend)?;
+    let mut offset: u64 = 0;
+    // Manual partial-write loop preserves the workaround for
+    // https://github.com/rust-vmm/vm-memory/issues/174
+    while offset < length {
+        let bytes_written = guest_memory
+            .write_volatile_to(GuestAddress(gpa + offset), file, (length - offset) as usize)
+            .context("Error writing memory snapshot region")
+            .map_err(MigratableError::MigrateSend)?;
+        offset += bytes_written as u64;
+    }
+    Ok(())
+}
+
+// Writes the guest pages that no longer read from the restore source over
+// the clone of that source in `file`.
+fn write_private_pages(
+    guest_memory: &GuestMemoryMmap,
+    source: &CowSource,
+    file: &mut File,
+) -> result::Result<(), MigratableError> {
+    let mut file_offset: u64 = 0;
+    for range in source.ranges.ranges() {
+        let host_addr = guest_memory
+            .get_host_address(GuestAddress(range.gpa))
+            .context("Error locating guest memory range")
+            .map_err(MigratableError::MigrateSend)?;
+        let private_ranges = source
+            .pagemap
+            .private_ranges(host_addr as u64, range.length)
+            .context("Error reading the pagemap")
+            .map_err(MigratableError::MigrateSend)?;
+        for private in private_ranges {
+            write_guest_range(
+                guest_memory,
+                file,
+                file_offset + private.start,
+                range.gpa + private.start,
+                private.end - private.start,
+            )?;
+        }
+        file_offset += range.length;
+    }
+    Ok(())
+}
+
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
 // preconditions. File-backed regions are rejected: their stale mapping
@@ -3863,8 +3940,7 @@ fn is_restore_cow_compatible(
     guest_memory: &GuestMemoryMmap,
     saved_regions: &MemoryRangeTable,
 ) -> bool {
-    // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page_size = get_page_size();
     let mut file_offset: u64 = 0;
     for range in saved_regions.ranges() {
         if !file_offset.is_multiple_of(page_size)
@@ -3987,6 +4063,7 @@ mod tests {
     }
 
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
 
     use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 
@@ -4022,11 +4099,6 @@ mod tests {
         }
     }
 
-    fn page_size() -> u64 {
-        // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
-        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
-    }
-
     fn new_served_bitmap(ranges: &[UffdRange]) -> Vec<AtomicBitmap> {
         ranges
             .iter()
@@ -4041,7 +4113,7 @@ mod tests {
 
     #[test]
     fn uffd_prefault_skips_present_pages_and_crosses_ranges() {
-        let page = page_size();
+        let page = get_page_size();
         let ranges = [
             UffdRange {
                 host_addr: 0x10_0000,
@@ -4121,7 +4193,7 @@ mod tests {
 
     #[test]
     fn uffd_prefault_retries_page_after_source_failure() {
-        let page = page_size();
+        let page = get_page_size();
         let ranges = [UffdRange {
             host_addr: 0x10_0000,
             length: page,
@@ -4178,7 +4250,7 @@ mod tests {
 
     #[test]
     fn cow_restore_maps_data_and_reads_holes_as_zero() {
-        let page = page_size();
+        let page = get_page_size();
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
 
         let mut file = tempfile::tempfile().unwrap();
@@ -4209,8 +4281,46 @@ mod tests {
     }
 
     #[test]
+    fn cow_snapshot_writes_private_pages_over_the_source() {
+        let page = get_page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (16 * page) as usize)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        for i in 0..16u8 {
+            file.write_all(&vec![i + 1; page as usize]).unwrap();
+        }
+        let mut ranges = MemoryRangeTable::default();
+        ranges.push(MemoryRange {
+            gpa: 0,
+            length: 16 * page,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &ranges, false).unwrap();
+        let source = CowSource {
+            file,
+            ranges,
+            pagemap: PageMap::open().unwrap(),
+        };
+        gm.write_obj::<u8>(0x55, GuestAddress(page)).unwrap();
+        gm.write_obj::<u8>(0x77, GuestAddress(12 * page + 9))
+            .unwrap();
+
+        let mut snapshot = tempfile::tempfile().unwrap();
+        let mut content = vec![0u8; (16 * page) as usize];
+        source.file.read_exact_at(&mut content, 0).unwrap();
+        snapshot.write_all(&content).unwrap();
+        write_private_pages(&gm, &source, &mut snapshot).unwrap();
+
+        let mut got = vec![0u8; (16 * page) as usize];
+        snapshot.read_exact_at(&mut got, 0).unwrap();
+        let mut want = vec![0u8; (16 * page) as usize];
+        gm.read_slice(&mut want, GuestAddress(0)).unwrap();
+        assert!(got == want);
+        assert_eq!(content[page as usize], 2);
+        assert_eq!(got[page as usize], 0x55);
+    }
+
+    #[test]
     fn cow_restore_rejects_unaligned_or_out_of_region_ranges() {
-        let page = page_size();
+        let page = get_page_size();
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
 
         let mut unaligned = MemoryRangeTable::default();
@@ -4230,7 +4340,7 @@ mod tests {
 
     #[test]
     fn cow_restore_rejects_file_backed_region() {
-        let page = page_size();
+        let page = get_page_size();
         let backing = tempfile::tempfile().unwrap();
         backing.set_len(page).unwrap();
         let region = MmapRegion::build(
@@ -4255,7 +4365,7 @@ mod tests {
 
     #[test]
     fn cow_restore_honors_region_reserve_and_thp() {
-        let page = page_size();
+        let page = get_page_size();
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&vec![0xcdu8; page as usize]).unwrap();
 

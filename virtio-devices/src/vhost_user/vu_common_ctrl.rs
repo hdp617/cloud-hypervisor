@@ -46,7 +46,7 @@ const VHOST_LOG_PAGE: u64 = 0x1000;
 #[derive(Debug, Clone)]
 pub struct VhostUserConfig {
     pub socket: String,
-    pub num_queues: usize,
+    pub num_queues: u16,
     pub queue_size: u16,
 }
 
@@ -117,7 +117,9 @@ impl VhostUserHandle {
 
         self.vu
             .add_mem_region(&region)
-            .map_err(Error::VhostUserAddMemReg)
+            .map_err(Error::VhostUserAddMemReg)?;
+
+        Ok(())
     }
 
     pub fn negotiate_features_vhost_user(
@@ -167,10 +169,12 @@ impl VhostUserHandle {
         inflight: Option<&mut Inflight>,
         vring_bases: Option<&[u64]>,
     ) -> Result<()> {
+        let num_queues = u16::try_from(queues.len()).map_err(|_| Error::BadQueueNum)?;
+
         if let Some(bases) = &vring_bases
             && bases.len() != queues.len()
         {
-            return Err(Error::VringBasesCountMismatch(bases.len(), queues.len()));
+            return Err(Error::VringBasesCountMismatch(bases.len(), num_queues));
         }
 
         // May run more than once on the same handle (resume after snapshot)
@@ -206,7 +210,7 @@ impl VhostUserHandle {
                 let inflight_req_info = VhostUserInflight {
                     mmap_size: 0,
                     mmap_offset: 0,
-                    num_queues: queues.len() as u16,
+                    num_queues,
                     queue_size: queues[0].1.size(),
                 };
                 let (info, fd) = self
@@ -413,7 +417,7 @@ impl VhostUserHandle {
     pub fn connect_vhost_user(
         server: bool,
         socket_path: &str,
-        num_queues: u64,
+        num_queues: u16,
         unlink_socket: bool,
         kill_evt: &EventFd,
         mut initialize: impl FnMut(&mut Self) -> Result<()>,
@@ -429,7 +433,7 @@ impl VhostUserHandle {
             let (stream, _) = listener.accept().map_err(Error::AcceptConnection)?;
 
             let mut vhost_user = Self {
-                vu: Frontend::from_stream(stream, num_queues),
+                vu: Frontend::from_stream(stream, num_queues as u64),
                 backend_features: 0,
                 ready: false,
                 supports_migration: false,
@@ -486,7 +490,7 @@ impl VhostUserHandle {
             let mut events = [EpollEvent::default(); 1];
 
             loop {
-                let connection = Frontend::connect(socket_path, num_queues)
+                let connection = Frontend::connect(socket_path, num_queues as u64)
                     .map(|vu| Self {
                         vu,
                         backend_features: 0,
@@ -733,7 +737,7 @@ impl VhostUserHandle {
     fn update_log_base(&mut self, last_ram_addr: u64) -> Result<Option<Arc<MmapRegion>>> {
         // Create the memfd
         let fd = memfd_create(
-            &ffi::CString::new("vhost_user_dirty_log").unwrap(),
+            c"vhost_user_dirty_log",
             libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
         )
         .map_err(Error::MemfdCreate)?;
@@ -744,8 +748,10 @@ impl VhostUserHandle {
         // covering all guest pages for addresses from 0 to the last physical
         // address in guest RAM.
         // A page is always 4kiB from a vhost-user perspective, and each bit is
-        // a page. That's how we can compute mmap_size from the last address.
-        let mmap_size = (last_ram_addr / (VHOST_LOG_PAGE * 8)) + 1;
+        // a page. The bitmap is read back as u64 words, so round it up to a
+        // whole word to keep the last pages of guest RAM covered.
+        let ram_size_per_u64 = VHOST_LOG_PAGE * u64::from(u64::BITS);
+        let mmap_size = (last_ram_addr / ram_size_per_u64 + 1) * size_of::<u64>() as u64;
         let mmap_handle = file.as_raw_fd();
 
         // Set shm_log region size

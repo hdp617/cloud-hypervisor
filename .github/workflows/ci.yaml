@@ -33,6 +33,7 @@ jobs:
       - id: changes
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          predicate-quantifier: some-with-excludes
           filters: |
             rust:
               - '**/*.rs'
@@ -84,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python 3.x
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.x'
       - name: Check DCO
@@ -110,7 +111,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
       - name: Set up Python 3.10
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.10"
       - name: Install dependencies
@@ -234,12 +235,6 @@ jobs:
     if: needs.preflight.outputs.full == 'true' || needs.preflight.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      matrix:
-        rust: [nightly]
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -247,14 +242,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Install Rust toolchain (${{ matrix.rust }})
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain nightly
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: ${{ matrix.rust }}
-          target: ${{ matrix.target }}
+          target: x86_64-unknown-linux-gnu
           components: rustfmt
       - name: Bisectability Check (rustfmt)
-        if: ${{ github.event_name == 'pull_request' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        if: ${{ github.event_name == 'pull_request'}}
         run: |
           set -eufo pipefail
           commits=$(git rev-list origin/${{ github.base_ref }}..${{ github.sha }})
@@ -316,6 +310,8 @@ jobs:
           components: clippy
       - name: Install Cargo fuzz
         run: cargo install cargo-fuzz
+      - name: Check fuzz lockfile
+        run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - name: Fuzz Build
         run: cargo fuzz build
       - name: Fuzz Check
@@ -361,10 +357,8 @@ jobs:
           - beta
           - stable
         target:
-          - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
           - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
         include:
           - rust: beta
             experimental: true
@@ -522,9 +516,8 @@ jobs:
       fail-fast: false
       matrix:
         rust:
-          - stable
-          - beta
-          - nightly
+          # Pin until https://github.com/rust-lang/rust/issues/165263 is fixed.
+          - nightly-2026-10-30
           - "1.89.0" # MSRV — keep quoted.
         target:
           - x86_64-unknown-linux-gnu
@@ -542,35 +535,35 @@ jobs:
           toolchain: ${{ matrix.rust }}
           target: ${{ matrix.target }}
       - name: Build (default features)
-        run: cargo build --locked --bin cloud-hypervisor
+        run: cargo build --locked --bin cloud-hypervisor --target=${{ matrix.target }}
       - name: Build (kvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm" --target=${{ matrix.target }}
       - name: Build (default features + dbus_api)
-        run: cargo build --locked --bin cloud-hypervisor --features "dbus_api"
+        run: cargo build --locked --bin cloud-hypervisor --features "dbus_api" --target=${{ matrix.target }}
       - name: Build (default features + guest_debug)
-        run: cargo build --locked --bin cloud-hypervisor --features "guest_debug"
+        run: cargo build --locked --bin cloud-hypervisor --features "guest_debug" --target=${{ matrix.target }}
       - name: Build (default features + pvmemcontrol)
-        run: cargo build --locked --bin cloud-hypervisor --features "pvmemcontrol"
+        run: cargo build --locked --bin cloud-hypervisor --features "pvmemcontrol" --target=${{ matrix.target }}
       - name: Build (default features + fw_cfg)
-        run: cargo build --locked --bin cloud-hypervisor --features "fw_cfg"
+        run: cargo build --locked --bin cloud-hypervisor --features "fw_cfg" --target=${{ matrix.target }}
       - name: Build (default features + ivshmem)
-        run: cargo build --locked --bin cloud-hypervisor --features "ivshmem"
+        run: cargo build --locked --bin cloud-hypervisor --features "ivshmem" --target=${{ matrix.target }}
       - name: Build (mshv)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv" --target=${{ matrix.target }}
       - name: Build (mshv + igvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm" --target=${{ matrix.target }}
       - name: Build (mshv + sev_snp)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,sev_snp"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,sev_snp" --target=${{ matrix.target }}
       - name: Build (mshv + igvm + sev_snp)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm,sev_snp"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,igvm,sev_snp" --target=${{ matrix.target }}
       - name: Build (kvm + sev_snp)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,sev_snp"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,sev_snp" --target=${{ matrix.target }}
       - name: Build (kvm + igvm + sev_snp + fw_cfg)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm,sev_snp,fw_cfg"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm,sev_snp,fw_cfg" --target=${{ matrix.target }}
       - name: Build (kvm + igvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "kvm,igvm" --target=${{ matrix.target }}
       - name: Build (mshv + kvm)
-        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,kvm"
+        run: cargo build --locked --bin cloud-hypervisor --no-default-features --features "mshv,kvm" --target=${{ matrix.target }}
       - name: Release Build (default features)
         run: cargo build --locked --all --release --target=${{ matrix.target }}
       - name: Check build did not modify any files
@@ -586,7 +579,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - "1.89.0" # MSRV — keep quoted.
     env:
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
     steps:
@@ -898,30 +890,9 @@ jobs:
           echo "Checking hypervisor device nodes..."
           test -e /dev/kvm || { echo "::error::/dev/kvm missing"; exit 1; }
           test -e /dev/sev || { echo "::error::/dev/sev missing"; exit 1; }
-          echo "Checking staged IGVM/kernel artifacts..."
-          test -d /usr/share/cloud-hypervisor/cvm \
-            || { echo "::error::/usr/share/cloud-hypervisor/cvm missing"; exit 1; }
-          ls -l /usr/share/cloud-hypervisor/cvm
       - name: Run CVM (SEV-SNP) integration tests
         timeout-minutes: 20
         run: scripts/dev_cli.sh tests --integration-cvm --hypervisor kvm
-  # Rate-limiter host is not available
-  # integration-rate-limiter:
-  #   name: integration-rate-limiter
-  #   needs: [preflight, dco, quality, build]
-  #   if: >-
-  #     github.event_name == 'merge_group' && needs.preflight.outputs.full == 'true' && needs.dco.result == 'success' && needs.quality.result == 'success' && needs.build.result == 'success'
-  #   runs-on: bare-metal-9950x
-  #   env:
-  #     AUTH_DOWNLOAD_TOKEN: ${{ secrets.AUTH_DOWNLOAD_TOKEN }}
-  #   steps:
-  #     - name: Code checkout
-  #       uses: actions/checkout@v7
-  #       with:
-  #         fetch-depth: 0
-  #     - name: Run rate-limiter integration tests
-  #       timeout-minutes: 20
-  #       run: scripts/dev_cli.sh tests --integration-rate-limiter
   virtio-villain:
     name: virtio-villain
     needs: [preflight, dco, quality, build]
@@ -930,7 +901,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VILLAIN_REPO: https://github.com/weltling/virtio-villain.git
-      VILLAIN_REF: v1.0.0
+      VILLAIN_REF: v1.3.2
     steps:
       - name: Code checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

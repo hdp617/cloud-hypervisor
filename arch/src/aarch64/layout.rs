@@ -5,50 +5,65 @@
 //
 // Memory layout of AArch64 guest:
 //
-// Physical  +---------------------------------------------------------------+
-// address   |                                                               |
-// end       |                                                               |
-//           ~                   ~                       ~                   ~
-//           |                                                               |
-//           |                      Highmem PCI MMIO space                   |
-//           |                                                               |
-// RAM end   +---------------------------------------------------------------+
-// (dynamic, |                                                               |
-// including |                                                               |
-// hotplug   ~                   ~                       ~                   ~
-// memory)   |                                                               |
-//           |                            DRAM                               |
-//           |                                                               |
-//           |                                                               |
-// 4GB       +---------------------------------------------------------------+
-//           |                      32-bit devices hole                      |
-// 4GB-64M   +---------------------------------------------------------------+
-//           |                                                               |
-//           |                                                               |
-//           |                            DRAM                               |
-//           |                                                               |
-//           |                                                               |
-// 1GB       +---------------------------------------------------------------+
-//           |                                                               |
-//           |                        PCI MMCONFIG space                     |
-//           |                                                               |
-// 768 M     +---------------------------------------------------------------+
-//           |                                                               |
-//           |                                                               |
-//           |                           PCI MMIO space                      |
-//           |                                                               |
-// 256 M     +---------------------------------------------------------------|
-//           |                                                               |
-//           |                        Legacy devices space                   |
-//           |                                                               |
-// 144 M     +---------------------------------------------------------------|
-//           |                                                               |
-//           |                    Reserved (now GIC is here)                 |
-//           |                                                               |
-//  4  M     +---------------------------------------------------------------+
-//           |                          UEFI flash                           |
-// 0GB       +---------------------------------------------------------------+
+// Physical                     +---------------------------------------------------------------+
+// address                      |                                                               |
+// end                          |                                                               |
+//                              ~                   ~                       ~                   ~
+//                              |                                                               |
+//                              |                     Highmem PCI MMIO space                    |
+//                              |                                                               |
+// RAM end                      +---------------------------------------------------------------+
+// (dynamic,                    |                                                               |
+// including                    |                                                               |
+// hotplug                      ~                   ~                       ~                   ~
+// memory)                      |                                                               |
+//                              |                              DRAM                             |
+//                              |                                                               |
+// 0x1_0000_0000 (4 GiB)        +---------------------------------------------------------------+
+//                              |            32-bit devices hole (TPM at 0xfed4_0000)           |
+// 0xfc00_0000 (4 GiB - 64 MiB) +---------------------------------------------------------------+
+//                              |                                                               |
+//                              |            DRAM, a direct-boot kernel at its start            |
+//                              |                                                               |
+// 0x4040_0000 (1 GiB + 4 MiB)  +---------------------------------------------------------------+
+//                              |                     SMBIOS tables (64 KiB)                    |
+// 0x403f_0000                  +---------------------------------------------------------------+
+//                              |                      EFI tables (64 KiB)                      |
+// 0x403e_0000                  +---------------------------------------------------------------+
+//                              |                 ACPI tables (2 MiB - 128 KiB)                 |
+// 0x4020_0000 (1 GiB + 2 MiB)  +---------------------------------------------------------------+
+//                              |                          FDT (2 MiB)                          |
+// 0x4000_0000 (1 GiB)          +---------------------------------------------------------------+
+//                              |                       PCI MMCONFIG space                      |
+// 0x3000_0000 (768 MiB)        +---------------------------------------------------------------+
+//                              |                                                               |
+//                              |                     32-bit PCI MMIO space                     |
+//                              |                                                               |
+// 0x1000_0000 (256 MiB)        +---------------------------------------------------------------+
+//                              |                             Unused                            |
+// 0x0906_0000                  +---------------------------------------------------------------+
+//                              |                         PCI I/O space                         |
+// 0x0905_0000                  +---------------------------------------------------------------+
+//                              |       Legacy devices: UART 0x0900_0000, RTC 0x0901_0000,      |
+//                              |             GPIO 0x0902_0000, ACPI TAD 0x0904_0000            |
+// 0x0900_0000 (144 MiB)        +---------------------------------------------------------------+
+//                              |                             Unused                            |
+// 0x0810_0000                  +---------------------------------------------------------------+
+//                              |                IORT RMR MSI IOVA window (1 MiB)               |
+// 0x0800_0000 (128 MiB)        +---------------------------------------------------------------+
+//                              |                       GICv3 Distributor                       |
+// 0x07ff_0000                  +---------------------------------------------------------------+
+//                              |          GICv3 Redistributors, 128 KiB per boot vCPU,         |
+//                              |                          growing down                         |
+//                              +---------------------------------------------------------------+
+//                              |                      GICv3 ITS (128 KiB)                      |
+//                              +---------------------------------------------------------------+
+//                              |                             Unused                            |
+// 0x0040_0000 (4 MiB)          +---------------------------------------------------------------+
+//                              |                           UEFI flash                          |
+// 0x0000_0000                  +---------------------------------------------------------------+
 //
+// With N boot vCPUs the ITS starts at 0x07fd_0000 - N * 128 KiB.
 //
 
 use vm_memory::GuestAddress;
@@ -59,21 +74,33 @@ pub const UEFI_START: GuestAddress = GuestAddress(0);
 pub const UEFI_SIZE: u64 = 0x040_0000;
 
 /// Below this address will reside the GIC, above this address will reside the MMIO devices.
-const MAPPED_IO_START: GuestAddress = GuestAddress(0x0900_0000);
+const MAPPED_IO_START: GuestAddress = GuestAddress(0x0800_0000);
 
 /// See kernel file arch/arm64/include/uapi/asm/kvm.h for the GIC related definitions.
-/// 0x08ff_0000 ~ 0x0900_0000 is reserved for GICv3 Distributor
+/// 0x07ff_0000 ~ 0x0800_0000 is reserved for GICv3 Distributor
 pub const GIC_V3_DIST_SIZE: u64 = 0x01_0000;
 pub const GIC_V3_DIST_START: GuestAddress = GuestAddress(MAPPED_IO_START.0 - GIC_V3_DIST_SIZE);
-/// Below 0x08ff_0000 is reserved for GICv3 Redistributor.
+/// Below 0x07ff_0000 is reserved for GICv3 Redistributor.
 /// The size defined here is for each vcpu.
 /// The total size is 'number_of_vcpu * GIC_V3_REDIST_SIZE'
 pub const GIC_V3_REDIST_SIZE: u64 = 0x02_0000;
 /// Below Redistributor area is GICv3 ITS
 pub const GIC_V3_ITS_SIZE: u64 = 0x02_0000;
+/// The most vCPUs whose Redistributors + ITS stay above the UEFI flash.
+pub const GIC_V3_LAYOUT_MAX_VCPUS: u64 =
+    (GIC_V3_DIST_START.0 - (UEFI_START.0 + UEFI_SIZE) - GIC_V3_ITS_SIZE) / GIC_V3_REDIST_SIZE;
+
+/// Space 0x0800_0000 ~ 0x0810_0000 (1 MiB) is reserved for the ACPI IORT RMR
+/// MSI IOVA doorbell window (matching the Linux kernel ARM SMMUv3 MSI_IOVA_BASE).
+pub const ACPI_IORT_RMR_MSI_IOVA_BASE: GuestAddress = MAPPED_IO_START;
+pub const ACPI_IORT_RMR_MSI_IOVA_LENGTH: u64 = 0x0010_0000;
+
+/// Legacy GICv3 Distributor start address (0x08ff_0000 ~ 0x0900_0000), used as
+/// a fallback when restoring snapshots that do not record the start address.
+pub const LEGACY_GIC_V3_DIST_START: GuestAddress = GuestAddress(0x0900_0000 - GIC_V3_DIST_SIZE);
 
 /// Space 0x0900_0000 ~ 0x0905_0000 is reserved for legacy devices.
-pub const LEGACY_SERIAL_MAPPED_IO_START: GuestAddress = MAPPED_IO_START;
+pub const LEGACY_SERIAL_MAPPED_IO_START: GuestAddress = GuestAddress(0x0900_0000);
 pub const LEGACY_RTC_MAPPED_IO_START: GuestAddress = GuestAddress(0x0901_0000);
 pub const LEGACY_GPIO_MAPPED_IO_START: GuestAddress = GuestAddress(0x0902_0000);
 pub const ACPI_TAD_MAPPED_IO_START: GuestAddress = GuestAddress(0x0904_0000);
@@ -86,7 +113,8 @@ pub const MEM_PCI_IO_SIZE: u64 = 0x10000;
 pub const MEM_32BIT_DEVICES_START: GuestAddress = GuestAddress(0x1000_0000);
 pub const MEM_32BIT_DEVICES_SIZE: u64 = 0x2000_0000;
 
-/// PCI MMCONFIG space (start: after the device space at 1 GiB, length: 256MiB)
+/// PCI MMCONFIG space (start: after the 32-bit device space at 768 MiB,
+/// length: 256 MiB, so it ends where RAM starts at 1 GiB)
 pub const PCI_MMCONFIG_START: GuestAddress = GuestAddress(0x3000_0000);
 pub const PCI_MMCONFIG_SIZE: u64 = 256 << 20;
 // One bus with potentially 256 devices (32 slots x 8 functions).

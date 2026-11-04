@@ -3,27 +3,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+//! Cloud Hypervisor implementation of QEMU's fw_cfg spec
+//! https://www.qemu.org/docs/master/specs/fw_cfg.html
+//! Linux kernel fw_cfg driver header
+//! https://github.com/torvalds/linux/blob/master/include/uapi/linux/qemu_fw_cfg.h
+//! Uploading files to the guest via fw_cfg is supported for all kernels 4.6+ w/ CONFIG_FW_CFG_SYSFS enabled
+//! https://cateee.net/lkddb/web-lkddb/FW_CFG_SYSFS.html
+//! No kernel requirement if above functionality is not required,
+//! only firmware must implement mechanism to interact with this fw_cfg device
+use std::cmp;
+use std::ffi::CString;
+use std::fs::File;
 #[cfg(target_arch = "x86_64")]
 use std::io::Error;
-/// Cloud Hypervisor implementation of QEMU's fw_cfg spec
-/// https://www.qemu.org/docs/master/specs/fw_cfg.html
-/// Linux kernel fw_cfg driver header
-/// https://github.com/torvalds/linux/blob/master/include/uapi/linux/qemu_fw_cfg.h
-/// Uploading files to the guest via fw_cfg is supported for all kernels 4.6+ w/ CONFIG_FW_CFG_SYSFS enabled
-/// https://cateee.net/lkddb/web-lkddb/FW_CFG_SYSFS.html
-/// No kernel requirement if above functionality is not required,
-/// only firmware must implement mechanism to interact with this fw_cfg device
-use std::{
-    cmp,
-    ffi::CString,
-    fs::File,
-    io::{ErrorKind, Read, Result, Seek, SeekFrom},
-    mem::offset_of,
-    os::unix::fs::FileExt,
-    sync::{Arc, Barrier},
-};
+use std::io::{ErrorKind, Result};
+use std::mem::offset_of;
+use std::os::unix::fs::FileExt;
+use std::sync::{Arc, Barrier};
 
 use acpi_tables::rsdp::Rsdp;
+use acpi_tables::{Aml, AmlSink, aml};
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::generate_e820_memory_map;
 use bitfield_struct::bitfield;
@@ -116,34 +115,6 @@ pub enum FwCfgContent {
     U32(u32),
 }
 
-struct FwCfgContentAccess<'a> {
-    content: &'a FwCfgContent,
-    offset: u32,
-}
-
-impl Read for FwCfgContentAccess<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        match self.content {
-            FwCfgContent::File(offset, f) => {
-                Seek::seek(&mut (&*f), SeekFrom::Start(offset + self.offset as u64))?;
-                Read::read(&mut (&*f), buf)
-            }
-            FwCfgContent::Bytes(b) => match b.get(self.offset as usize..) {
-                Some(mut s) => s.read(buf),
-                None => Err(ErrorKind::UnexpectedEof)?,
-            },
-            FwCfgContent::Slice(b) => match b.get(self.offset as usize..) {
-                Some(mut s) => s.read(buf),
-                None => Err(ErrorKind::UnexpectedEof)?,
-            },
-            FwCfgContent::U32(n) => match n.to_le_bytes().get(self.offset as usize..) {
-                Some(mut s) => s.read(buf),
-                None => Err(ErrorKind::UnexpectedEof)?,
-            },
-        }
-    }
-}
-
 impl Default for FwCfgContent {
     fn default() -> Self {
         FwCfgContent::Slice(&[])
@@ -164,12 +135,6 @@ impl FwCfgContent {
             FwCfgContent::U32(n) => size_of_val(n),
         };
         u32::try_from(ret).map_err(|_| ErrorKind::InvalidInput.into())
-    }
-    fn access(&self, offset: u32) -> FwCfgContentAccess<'_> {
-        FwCfgContentAccess {
-            content: self,
-            offset,
-        }
     }
 }
 
@@ -515,18 +480,11 @@ impl FwCfg {
         Ok(())
     }
 
-    fn dma_read_content(
-        &self,
-        content: &FwCfgContent,
-        offset: u32,
-        len: u32,
-        address: u64,
-    ) -> Result<u32> {
-        let content_size = content.size()?.saturating_sub(offset);
+    fn dma_read_content(&self, content: &FwCfgContent, len: u32, address: u64) -> Result<u32> {
+        let content_size = content.size()?.saturating_sub(self.data_offset);
         let op_size = cmp::min(content_size, len);
-        let mut access = content.access(offset);
         let mut buf = vec![0u8; op_size as usize];
-        access.read_exact(buf.as_mut_bytes())?;
+        Self::read_content(content, self.data_offset, buf.as_mut_bytes())?;
         let r = self
             .memory
             .memory()
@@ -552,15 +510,25 @@ impl FwCfg {
         content.size().ok()
     }
 
-    fn dma_read(&mut self, selector: u16, len: u32, address: u64) -> Result<()> {
-        let op_size = if let Some(content) = self.known_items.get(selector as usize) {
-            self.dma_read_content(content, self.data_offset, len, address)
-        } else if let Some(item) = self.items.get((selector - FW_CFG_FILE_FIRST) as usize) {
-            self.dma_read_content(&item.content, self.data_offset, len, address)
+    /// Retrieves the [`FwCfgContent`] corresponding to the selector currently set in the internal
+    /// selector buffer.
+    fn get_selected_content(&self) -> Result<&FwCfgContent> {
+        if let Some(known_item) = self.known_items.get(usize::from(self.selector)) {
+            Ok(known_item)
+        } else if let Some(item) = self
+            .items
+            .get(usize::from(self.selector - FW_CFG_FILE_FIRST))
+        {
+            Ok(&item.content)
         } else {
-            error!("fw_cfg: selector {selector:#x} does not exist.");
+            error!("fw_cfg: selector {:#x} does not exist.", self.selector);
             Err(ErrorKind::NotFound.into())
-        }?;
+        }
+    }
+
+    fn dma_read(&mut self, len: u32, address: u64) -> Result<()> {
+        let content = self.get_selected_content()?;
+        let op_size = self.dma_read_content(content, len, address)?;
         self.data_offset += op_size;
         Ok(())
     }
@@ -589,7 +557,7 @@ impl FwCfg {
         let len = u32::from_be(dma_access.length_be);
         let addr = u64::from_be(dma_access.address_be);
         let ret = if control.read() {
-            self.dma_read(self.selector, len, addr)
+            self.dma_read(len, addr)
         } else if control.write() {
             Err(ErrorKind::InvalidInput.into())
         } else if control.skip() {
@@ -700,11 +668,11 @@ impl FwCfg {
         Ok(())
     }
 
-    fn read_content(content: &FwCfgContent, offset: u32, data: &mut [u8], size: u32) -> Option<u8> {
+    fn read_content(content: &FwCfgContent, offset: u32, data: &mut [u8]) -> Result<()> {
         // Zero fill rather than the usual 0xff fill for QEMU compatibility
         data.fill(0);
         let start = offset as usize;
-        let end = start + size as usize;
+        let end = start + data.len();
         match content {
             FwCfgContent::Bytes(b) => {
                 if end <= b.len() {
@@ -717,7 +685,7 @@ impl FwCfg {
                 }
             }
             FwCfgContent::File(o, f) => {
-                f.read_exact_at(data, o + offset as u64).ok()?;
+                f.read_exact_at(data, o + offset as u64)?;
             }
             FwCfgContent::U32(n) => {
                 let bytes = n.to_le_bytes();
@@ -726,35 +694,58 @@ impl FwCfg {
                 }
             }
         }
-        Some(size as u8)
+        Ok(())
     }
 
-    fn read_data(&mut self, data: &mut [u8], size: u32) -> u8 {
-        let ret = if let Some(content) = self.known_items.get(self.selector as usize) {
-            Self::read_content(content, self.data_offset, data, size)
-        } else if let Some(item) = self.items.get((self.selector - FW_CFG_FILE_FIRST) as usize) {
-            Self::read_content(&item.content, self.data_offset, data, size)
-        } else {
-            error!("fw_cfg: selector {:#x} does not exist.", self.selector);
-            None
-        };
-        if let Some(val) = ret {
-            self.data_offset += size;
-            val
-        } else {
-            0
+    fn read_data(&mut self, data: &mut [u8]) {
+        if let Ok(content) = self.get_selected_content()
+            && Self::read_content(content, self.data_offset, data).is_ok()
+        {
+            self.data_offset += data.len() as u32;
         }
+    }
+}
+
+impl Aml for FwCfg {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        aml::Device::new(
+            "_SB_.FWCF".into(),
+            vec![
+                &aml::Name::new("_HID".into(), &FW_CFG_ACPI_ID.to_string()),
+                &aml::Name::new("_STA".into(), &0xB_usize),
+                #[cfg(target_arch = "aarch64")]
+                &aml::Name::new("_CCA".into(), &aml::ONE),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![
+                        #[cfg(target_arch = "x86_64")]
+                        &aml::IO::new(
+                            FW_CFG_ADDRESS_BASE as u16,
+                            FW_CFG_ADDRESS_BASE as u16,
+                            0x01,
+                            FW_CFG_ADDRESS_WIDTH as u8,
+                        ),
+                        #[cfg(target_arch = "aarch64")]
+                        &aml::Memory32Fixed::new(
+                            true,
+                            FW_CFG_ADDRESS_BASE as u32,
+                            FW_CFG_ADDRESS_WIDTH as u32,
+                        ),
+                    ]),
+                ),
+            ],
+        )
+        .to_aml_bytes(sink);
     }
 }
 
 impl BusDevice for FwCfg {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
-        let size = data.len();
-        match (offset, size) {
+        match (offset, data.len()) {
             (FW_CFG_SELECTOR_OFFSET, _) => {
                 error!("fw_cfg: selector register is write-only.");
             }
-            (FW_CFG_DATA_OFFSET, _) => _ = self.read_data(data, size as u32),
+            (FW_CFG_DATA_OFFSET, _) => self.read_data(data),
             (FW_CFG_DMA_HI_OFFSET, 4) => {
                 let addr = self.dma_address;
                 let addr_hi = (addr >> 32) as u32;
@@ -766,7 +757,10 @@ impl BusDevice for FwCfg {
                 data.copy_from_slice(&addr_lo.to_be_bytes());
             }
             _ => {
-                debug!("fw_cfg: read from unknown offset {offset:#x}: {size:#x} bytes.");
+                debug!(
+                    "fw_cfg: read from unknown offset {offset:#x}: {:#x} bytes.",
+                    data.len()
+                );
             }
         }
     }
@@ -821,6 +815,15 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+
+    /// Selects `key` with the correct byte order
+    fn select(fw_cfg: &mut FwCfg, key: u16) {
+        #[cfg(target_arch = "x86_64")] // port IO -> little endian
+        let key = key.to_le_bytes();
+        #[cfg(target_arch = "aarch64")] // MMIO -> big endian
+        let key = key.to_be_bytes();
+        fw_cfg.write(0, FW_CFG_SELECTOR_OFFSET, &key);
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -904,7 +907,7 @@ mod tests {
         let mut data = vec![0u8];
 
         let mut sig_iter = FW_CFG_SIGNATURE_CONTENT.into_iter();
-        fw_cfg.write(0, FW_CFG_SELECTOR_OFFSET, &[FW_CFG_SIGNATURE as u8, 0]);
+        select(&mut fw_cfg, FW_CFG_SIGNATURE);
         loop {
             if let Some(char) = sig_iter.next() {
                 fw_cfg.read(0, FW_CFG_DATA_OFFSET, &mut data);
@@ -930,7 +933,7 @@ mod tests {
         let mut data = vec![0u8];
 
         let mut cmdline_iter = cmdline.into_iter();
-        fw_cfg.write(0, FW_CFG_SELECTOR_OFFSET, &[FW_CFG_CMDLINE_DATA as u8, 0]);
+        select(&mut fw_cfg, FW_CFG_CMDLINE_DATA);
         loop {
             if let Some(char) = cmdline_iter.next() {
                 fw_cfg.read(0, FW_CFG_DATA_OFFSET, &mut data);
@@ -955,7 +958,7 @@ mod tests {
         fw_cfg.add_kernel_data(temp.as_file()).unwrap();
 
         let mut size = [0u8; size_of::<u32>()];
-        fw_cfg.write(0, FW_CFG_SELECTOR_OFFSET, &FW_CFG_KERNEL_SIZE.to_be_bytes());
+        select(&mut fw_cfg, FW_CFG_KERNEL_SIZE);
         fw_cfg.read(0, FW_CFG_DATA_OFFSET, &mut size);
         assert_eq!(u32::from_le_bytes(size), kernel.len() as u32);
 
@@ -984,7 +987,7 @@ mod tests {
         let mut data = vec![0u8];
 
         let mut initram_iter = (*initram_content).into_iter();
-        fw_cfg.write(0, FW_CFG_SELECTOR_OFFSET, &[FW_CFG_INITRD_DATA as u8, 0]);
+        select(&mut fw_cfg, FW_CFG_INITRD_DATA);
         loop {
             if let Some(char) = initram_iter.next() {
                 fw_cfg.read(0, FW_CFG_DATA_OFFSET, &mut data);
@@ -1014,7 +1017,7 @@ mod tests {
         let mut data = vec![0u8];
 
         // Select the first file item (FW_CFG_FILE_FIRST = 0x20)
-        fw_cfg.write(0, FW_CFG_SELECTOR_OFFSET, &[FW_CFG_FILE_FIRST as u8, 0]);
+        select(&mut fw_cfg, FW_CFG_FILE_FIRST);
         for &byte in expected.iter() {
             fw_cfg.read(0, FW_CFG_DATA_OFFSET, &mut data);
             assert_eq!(data[0], byte);
